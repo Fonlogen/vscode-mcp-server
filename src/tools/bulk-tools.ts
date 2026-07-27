@@ -4,62 +4,144 @@ import { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { logger } from '../utils/logger';
 
 /**
- * Registers the bulk_execute tool with the MCP server.
+ * Registers two tools:
  *
- * This tool allows an AI to batch up to 20 tool calls into a single MCP request,
- * receiving all results in one response. This is especially useful for clients
- * (e.g. Perplexity) that have a hard limit on the number of tool calls per session.
+ * 1. `_instructions` — a meta-tool (underscore prefix so it sorts first alphabetically)
+ *    that the AI reads on every session. It contains mandatory behavioral rules,
+ *    most importantly: ALWAYS use bulk_execute when doing 2+ independent operations.
  *
- * Usage example (AI perspective):
- *   bulk_execute({
- *     calls: [
- *       { tool: "read_file_code", args: { path: "src/index.ts" } },
- *       { tool: "list_files_code", args: { path: "src", recursive: false } }
- *     ]
- *   })
+ * 2. `bulk_execute` — batches up to 20 tool calls into one MCP request, returning
+ *    all results in a single response. Essential for clients with per-session tool-call
+ *    limits (e.g. Perplexity: max 20 calls/request).
  */
 export function registerBulkTools(server: McpServer): void {
+
+    // -----------------------------------------------------------------------
+    // _instructions  (sorts first — AI reads this before any other tool)
+    // -----------------------------------------------------------------------
+    server.tool(
+        '_instructions',
+        `## MANDATORY RULES — read before every session
+
+⚠️  THIS CLIENT HAS A HARD LIMIT OF 20 TOOL CALLS PER SESSION.
+    Every wasted call brings you closer to the limit and degrades the user experience.
+
+════════════════════════════════════════════════════════
+ RULE #1 — ALWAYS USE bulk_execute FOR 2+ INDEPENDENT OPS
+════════════════════════════════════════════════════════
+
+Whenever you need to perform TWO OR MORE operations that do NOT depend on
+each other's results, you MUST batch them into a single bulk_execute call.
+
+DO THIS:
+  bulk_execute({ calls: [
+    { tool: "read_file_code",  args: { path: "src/index.ts" } },
+    { tool: "read_file_code",  args: { path: "src/utils.ts" } },
+    { tool: "list_files_code", args: { path: "src", recursive: false } }
+  ]})
+  → 1 tool call, 3 results
+
+NOT THIS:
+  read_file_code({ path: "src/index.ts" })   ← 1st call
+  read_file_code({ path: "src/utils.ts" })   ← 2nd call  (WASTEFUL)
+  list_files_code({ path: "src" })           ← 3rd call  (WASTEFUL)
+  → 3 tool calls wasted
+
+════════════════════════════════════════════════════════
+ RULE #2 — PLAN BEFORE CALLING
+════════════════════════════════════════════════════════
+
+Before making ANY tool call, ask yourself:
+  "Do I need more than one thing right now?"
+  If YES → use bulk_execute.
+  If NO  → use the individual tool.
+
+Common patterns that MUST use bulk_execute:
+  - Reading multiple files                  → bulk_execute
+  - Checking if multiple files/paths exist  → bulk_execute
+  - Getting diagnostics + reading a file    → bulk_execute
+  - Listing files + reading a file          → bulk_execute
+  - Running unrelated shell commands        → NOT supported (shell is interactive, run individually)
+
+════════════════════════════════════════════════════════
+ RULE #3 — DO NOT CALL THIS TOOL AGAIN
+════════════════════════════════════════════════════════
+
+This tool (_instructions) is informational only. It returns no useful data.
+Call it ONCE at session start if you need a reminder. Never call it again.
+
+════════════════════════════════════════════════════════
+ AVAILABLE TOOLS SUMMARY
+════════════════════════════════════════════════════════
+
+  _instructions       — These rules (this tool). Read once.
+  bulk_execute        — Batch up to 20 tool calls. USE THIS.
+  read_file_code      — Read a workspace file
+  list_files_code     — List files/directories
+  move_file_code      — Move a file
+  rename_file_code    — Rename a file
+  copy_file_code      — Copy a file
+  edit tools          — write_file, apply_diff, etc.
+  shell tools         — run_in_terminal (interactive, not batchable)
+  diagnostics tools   — get_diagnostics, etc.
+  symbol tools        — find symbols, references, etc.
+
+All of the above EXCEPT shell tools can be batched inside bulk_execute.`,
+        {},
+        async (): Promise<CallToolResult> => {
+            return {
+                content: [{
+                    type: 'text',
+                    text: 'Instructions acknowledged. Remember: use bulk_execute for all independent multi-step operations to conserve your tool-call budget.'
+                }]
+            };
+        }
+    );
+
+    // -----------------------------------------------------------------------
+    // bulk_execute
+    // -----------------------------------------------------------------------
     server.tool(
         'bulk_execute',
-        `Executes multiple tool calls in a single request and returns all results.
+        `Executes up to 20 tool calls in a single request and returns all results.
 
-        USE THIS TOOL to save tool-call budget. Instead of calling N separate tools,
-        pack them all here and get N results back in one shot.
+⚠️  MANDATORY USAGE — See _instructions tool for full rules.
 
-        WHEN TO USE:
-        - Checking existence / reading multiple files at once
-        - Running several independent operations that don't depend on each other
-        - Any situation where you would make 2+ consecutive tool calls with unrelated inputs
+Short version:
+  ANY time you need 2+ independent operations, use THIS tool.
+  One bulk_execute = one tool call consumed, regardless of how many sub-calls.
 
-        LIMITS:
-        - Maximum 20 calls per bulk_execute invocation
-        - Each call must specify a valid "tool" name (same names as the normal tools)
-        - Each call must include an "args" object matching that tool's expected parameters
+EXAMPLE:
+  bulk_execute({ calls: [
+    { tool: "read_file_code", args: { path: "a.ts" } },
+    { tool: "read_file_code", args: { path: "b.ts" } },
+    { tool: "list_files_code", args: { path: "src" } }
+  ]})
+  → Returns array of 3 results in one shot.
 
-        RETURNS: A JSON array where each element is the result (or error) for the
-        corresponding call, in the same order as the input.
+LIMITS:
+  - min 1, max 20 calls per invocation
+  - Each entry: { tool: "<tool_name>", args: { ...params } }
+  - Failed sub-calls return { error: "..." } and do NOT abort the rest
+  - Shell tools (run_in_terminal) are interactive and cannot be batched
 
-        IMPORTANT: Results for failed sub-calls contain an "error" field instead of
-        "content", but will NOT abort the remaining calls.`,
+RETURNS:
+  JSON array: [ { tool, index, result? } | { tool, index, error? } ]`,
         {
             calls: z
                 .array(
                     z.object({
-                        tool: z.string().describe('The name of the tool to call (e.g. "read_file_code")'),
-                        args: z.record(z.unknown()).describe('The arguments object for that tool')
+                        tool: z.string().describe('Tool name, e.g. "read_file_code", "list_files_code"'),
+                        args: z.record(z.unknown()).describe('Arguments object for that tool')
                     })
                 )
                 .min(1)
                 .max(20)
-                .describe('Array of tool calls to execute. Maximum 20 entries.')
+                .describe('Array of { tool, args } objects to execute. Max 20.')
         },
         async ({ calls }): Promise<CallToolResult> => {
             logger.info(`[bulk_execute] Received ${calls.length} sub-call(s)`);
 
-            // We need access to the McpServer's registered tool handlers.
-            // The MCP SDK exposes them via (server as any)._registeredTools which is
-            // an internal map of { name -> { handler, inputSchema } }.
-            // This is the only way to dispatch calls without a separate HTTP round-trip.
             const registeredTools: Map<string, { inputSchema: unknown; handler: (args: unknown) => Promise<CallToolResult> }> =
                 (server as any)._registeredTools;
 
@@ -74,7 +156,7 @@ export function registerBulkTools(server: McpServer): void {
                     results.push({
                         tool,
                         index: i,
-                        error: `Tool "${tool}" is not registered or not available.`
+                        error: `Tool "${tool}" is not registered or not available. Check _instructions for valid tool names.`
                     });
                     continue;
                 }
@@ -94,12 +176,10 @@ export function registerBulkTools(server: McpServer): void {
             logger.info(`[bulk_execute] All ${calls.length} sub-calls complete`);
 
             return {
-                content: [
-                    {
-                        type: 'text',
-                        text: JSON.stringify(results, null, 2)
-                    }
-                ]
+                content: [{
+                    type: 'text',
+                    text: JSON.stringify(results, null, 2)
+                }]
             };
         }
     );
