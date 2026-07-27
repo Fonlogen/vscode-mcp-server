@@ -28,7 +28,8 @@ function getToolConfiguration(): ToolConfiguration {
         edit: enabledTools.edit ?? true,
         shell: enabledTools.shell ?? true,
         diagnostics: enabledTools.diagnostics ?? true,
-        symbol: enabledTools.symbol ?? true
+        symbol: enabledTools.symbol ?? true,
+        bulk: enabledTools.bulk ?? true
     };
 }
 
